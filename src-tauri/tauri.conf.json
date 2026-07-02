@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TeXLens",
+  "version": "0.1.0",
+  "identifier": "dev.texlens.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "TeXLens",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 980,
+        "minHeight": 680,
+        "backgroundColor": "#f7f8f4",
+        "transparent": false,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPDATA/**", "$APPCACHE/**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["appimage"],
+    "icon": [
+      "icons/icon.png"
+    ],
+    "resources": [
+      "../sidecar/src",
+      "../sidecar/pyproject.toml",
+      "../sidecar/uv.lock",
+      "../sidecar/README.md",
+      "../docs",
+      "../samples"
+    ]
+  }
+}
