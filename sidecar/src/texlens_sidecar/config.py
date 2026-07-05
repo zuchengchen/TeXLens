@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -41,12 +41,6 @@ DEFAULT_FASTDEPLOY_ARGS = [
 
 DEFAULT_HOTKEY = "Ctrl+Alt+M"
 DEFAULT_CLEANUP_POLICY = "history_ttl"
-DEFAULT_PROMPT_TEMPLATES = {
-    "auto": "OCR:",
-    "formula": "Formula Recognition:",
-    "table": "Table Recognition:",
-    "text": "OCR:",
-}
 DEFAULT_LATEX_TEMPLATE = "\n".join(
     [
         r"\documentclass[UTF8]{ctexart}",
@@ -85,8 +79,6 @@ class Settings(BaseSettings):
     history_days: int = 30
     cleanup_policy: str = DEFAULT_CLEANUP_POLICY
     hotkey: str = DEFAULT_HOTKEY
-    prompt_templates: Dict[str, str] = Field(default_factory=lambda: DEFAULT_PROMPT_TEMPLATES.copy())
-    latex_template: str = DEFAULT_LATEX_TEMPLATE
     request_timeout_seconds: float = 300.0
     latex_engine: str = "xelatex"
 

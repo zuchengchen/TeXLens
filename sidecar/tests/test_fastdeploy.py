@@ -1,40 +1,40 @@
 from texlens_sidecar.config import Settings
-from texlens_sidecar.fastdeploy import FastDeployManager, infer_block_type, parse_structured_response, prompt_for_mode
+from texlens_sidecar.fastdeploy import FastDeployManager, infer_content_type, ocr_prompt, parse_structured_response
 from texlens_sidecar.models import ServiceState
 
 
 def test_prompt_uses_paddleocr_vl_native_task_words():
-    assert prompt_for_mode("formula") == "Formula Recognition:"
-    assert prompt_for_mode("table") == "Table Recognition:"
-    assert prompt_for_mode("auto") == "OCR:"
+    assert ocr_prompt() == "OCR:"
 
 
-def test_prompt_can_be_overridden_from_runtime_settings():
-    assert prompt_for_mode("formula", {"formula": "Formula Recognition:\nReturn LaTeX only."}) == (
-        "Formula Recognition:\nReturn LaTeX only."
-    )
-
-
-def test_native_formula_output_becomes_formula_block():
-    parsed = parse_structured_response(r"\[\begin{aligned}a&=b\end{aligned}\]", {}, "auto")
-    assert parsed["blocks"][0]["type"] == "formula"
+def test_native_formula_output_becomes_body_latex():
+    parsed = parse_structured_response(r"\[\begin{aligned}a&=b\end{aligned}\]", {})
+    assert "\\begin{equation}" in parsed["body"]
+    assert "\\begin{aligned}" in parsed["body"]
     assert "latex_document" not in parsed
 
 
-def test_auto_text_splits_title_and_formula_blocks():
-    parsed = parse_structured_response("Complex derivation\n\nE &= mc^2\n\\int_0^\\infty e^{-x^2} dx &= y", {}, "auto")
-    assert [block["type"] for block in parsed["blocks"]] == ["title", "formula"]
+def test_dollar_display_formula_output_becomes_body_latex():
+    parsed = parse_structured_response("$$E=mc^2$$", {})
+    assert "\\begin{equation}\nE=mc^2\n\\end{equation}" in parsed["body"]
 
 
-def test_auto_text_splits_title_and_pipe_table_blocks():
-    parsed = parse_structured_response("Experiment Table\n\nMethod | Accuracy\nOCR-VL | 96.3", {}, "auto")
-    assert [block["type"] for block in parsed["blocks"]] == ["title", "table"]
+def test_auto_text_splits_title_and_formula_body():
+    parsed = parse_structured_response("Complex derivation\n\nE &= mc^2\n\\int_0^\\infty e^{-x^2} dx &= y", {})
+    assert "\\section*{Complex derivation}" in parsed["body"]
+    assert "\\begin{equation}" in parsed["body"]
 
 
-def test_mode_hint_sets_table_block():
-    parsed = parse_structured_response("<fcel>A<fcel>B<nl>", {}, "table")
-    assert parsed["blocks"][0]["type"] == "table"
-    assert infer_block_type("<fcel>A<nl>", "auto") == "table"
+def test_auto_text_splits_title_and_pipe_table_body():
+    parsed = parse_structured_response("Experiment Table\n\nMethod | Accuracy\nOCR-VL | 96.3", {})
+    assert "\\section*{Experiment Table}" in parsed["body"]
+    assert "\\begin{tabular}" in parsed["body"]
+
+
+def test_table_tokens_infer_table_content():
+    parsed = parse_structured_response("<fcel>A<fcel>B<nl>", {})
+    assert "\\begin{tabular}" in parsed["body"]
+    assert infer_content_type("<fcel>A<nl>") == "table"
 
 
 def test_fastdeploy_process_uses_writable_runtime_cwd(tmp_path, monkeypatch):
@@ -70,3 +70,23 @@ def test_fastdeploy_process_uses_writable_runtime_cwd(tmp_path, monkeypatch):
 
     assert captured["cwd"] == str(settings.cache_dir / "fastdeploy-runtime")
     assert (settings.cache_dir / "fastdeploy-runtime").is_dir()
+
+
+def test_fastdeploy_start_reuses_reachable_existing_service(tmp_path, monkeypatch):
+    settings = Settings(
+        cache_dir=tmp_path / "cache",
+        config_dir=tmp_path / "config",
+        data_dir=tmp_path / "data",
+        model_dir=tmp_path / "model",
+        fastdeploy_python="/usr/bin/python",
+    )
+    manager = FastDeployManager(settings)
+    existing = ServiceState(running=True, pid=None, endpoint=settings.fastdeploy_endpoint, healthy=True)
+
+    monkeypatch.setattr(manager, "status", lambda: existing)
+    monkeypatch.setattr(
+        "texlens_sidecar.fastdeploy.subprocess.Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not spawn")),
+    )
+
+    assert manager.start() == existing

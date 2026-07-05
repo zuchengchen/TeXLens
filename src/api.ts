@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { hasTauriRuntime } from "./hotkeys";
+import { normalizeLatexSource } from "./store";
 import { testBridge } from "./testBridge";
 import type {
   DocumentResult,
@@ -8,8 +10,6 @@ import type {
   LatexCompileResult,
   ObservabilitySnapshot,
   OCRTaskState,
-  RecognitionMode,
-  RepairSuggestion,
   RuntimeSettings,
   ServiceState,
 } from "./types";
@@ -93,19 +93,18 @@ export async function updateRuntimeSettings(update: Partial<RuntimeSettings>): P
 
 export async function recognizePath(
   path: string,
-  mode: RecognitionMode = "auto",
   sourceType = path.toLowerCase().endsWith(".pdf") ? "pdf" : "image",
 ): Promise<DocumentResult> {
   return jsonFetch<DocumentResult>("/ocr/recognize", {
     method: "POST",
-    body: JSON.stringify({ path, source_type: sourceType, mode }),
+    body: JSON.stringify({ path, source_type: sourceType }),
   });
 }
 
-export async function startPdfTask(path: string, mode: RecognitionMode, title?: string): Promise<OCRTaskState> {
+export async function startPdfTask(path: string, title?: string): Promise<OCRTaskState> {
   return jsonFetch<OCRTaskState>("/ocr/tasks/pdf", {
     method: "POST",
-    body: JSON.stringify({ path, mode, title }),
+    body: JSON.stringify({ path, title }),
   });
 }
 
@@ -121,17 +120,6 @@ export async function retryFailedOcrTask(taskId: string): Promise<OCRTaskState> 
   return jsonFetch<OCRTaskState>(`/ocr/tasks/${taskId}/retry-failed`, { method: "POST" });
 }
 
-export async function rerunBlock(
-  documentId: string,
-  blockId: string,
-  mode: RecognitionMode,
-): Promise<DocumentResult> {
-  return jsonFetch<DocumentResult>("/ocr/rerun-block", {
-    method: "POST",
-    body: JSON.stringify({ document_id: documentId, block_id: blockId, mode }),
-  });
-}
-
 export async function listHistory(query = ""): Promise<DocumentResult[]> {
   return jsonFetch<DocumentResult[]>(`/history${query ? `?q=${encodeURIComponent(query)}` : ""}`);
 }
@@ -140,22 +128,19 @@ export async function clearHistory(): Promise<{ deleted: number }> {
   return jsonFetch<{ deleted: number }>("/history", { method: "DELETE" });
 }
 
-export async function repairLatex(latex: string, compilerLog = ""): Promise<RepairSuggestion> {
-  return jsonFetch<RepairSuggestion>("/latex/repair", {
-    method: "POST",
-    body: JSON.stringify({ latex, compiler_log: compilerLog }),
-  });
-}
-
 export async function compileLatex(latex: string): Promise<LatexCompileResult> {
+  const normalizedLatex = normalizeLatexSource(latex);
   try {
-    return await invoke<LatexCompileResult>("compile_latex_preview", { latex });
-  } catch {
+    return await invoke<LatexCompileResult>("compile_latex_preview", { latex: normalizedLatex });
+  } catch (err) {
+    if (hasTauriRuntime()) {
+      throw err;
+    }
     // Browser e2e and older development shells still use the sidecar endpoint.
   }
   return jsonFetch<LatexCompileResult>("/latex/compile", {
     method: "POST",
-    body: JSON.stringify({ latex }),
+    body: JSON.stringify({ latex: normalizedLatex }),
   });
 }
 

@@ -11,7 +11,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "NO_STRIP=1 tauri build",
+    "tauri:build": "NO_STRIP=1 sh scripts/tauri-build-appimage.sh",
     "lint": "eslint . --max-warnings=0",
     "test": "vitest run",
     "e2e": "playwright test",

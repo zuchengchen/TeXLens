@@ -12,6 +12,7 @@ from typing import List, Optional
 from PIL import Image
 
 from .config import Settings
+from .latex import extract_latex_body, normalize_latex_document, wrap_latex_body
 from .models import DocumentResult
 
 
@@ -128,7 +129,7 @@ class Storage:
             row = db.execute("select payload_json from documents where id = ?", (document_id,)).fetchone()
         if row is None:
             raise KeyError(document_id)
-        return DocumentResult.model_validate_json(row["payload_json"])
+        return self._normalize_document(DocumentResult.model_validate_json(row["payload_json"]))
 
     def list_documents(self, query: str = "", limit: int = 50) -> List[DocumentResult]:
         with self.connect() as db:
@@ -150,7 +151,15 @@ class Storage:
                     "select payload_json from documents order by created_at desc limit ?",
                     (limit,),
                 ).fetchall()
-        return [DocumentResult.model_validate_json(row["payload_json"]) for row in rows]
+        return [
+            self._normalize_document(DocumentResult.model_validate_json(row["payload_json"]))
+            for row in rows
+        ]
+
+    def _normalize_document(self, document: DocumentResult) -> DocumentResult:
+        document.body = normalize_latex_document(document.body or extract_latex_body(document.latex)).strip()
+        document.latex = wrap_latex_body(document.body, document.title)
+        return document
 
     def record_metric(self, document_id: Optional[str], payload: dict) -> None:
         with self.connect() as db:

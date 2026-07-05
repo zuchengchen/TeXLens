@@ -1,5 +1,6 @@
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -8,6 +9,7 @@ from texlens_sidecar.app import (
     apply_saved_runtime_settings,
     create_app,
     python_module_status,
+    render_pdf_preview_pages,
     save_runtime_settings,
     summarize_latex_errors,
 )
@@ -39,6 +41,25 @@ def test_summarize_latex_errors_keeps_actionable_error_context():
     assert "Sometimes, the -f option" not in summary
 
 
+def test_render_pdf_preview_pages_returns_all_sorted_pages(tmp_path, monkeypatch):
+    monkeypatch.setattr("texlens_sidecar.app.shutil.which", lambda command: "/usr/bin/pdftoppm")
+
+    def fake_run(command, **kwargs):
+        output_base = Path(command[-1])
+        (output_base.parent / f"{output_base.name}-2.png").write_bytes(b"page2")
+        (output_base.parent / f"{output_base.name}-1.png").write_bytes(b"page1")
+        return None
+
+    monkeypatch.setattr("texlens_sidecar.app.subprocess.run", fake_run)
+    output_base = tmp_path / "preview"
+    (tmp_path / "preview-9.png").write_bytes(b"stale")
+
+    pages = render_pdf_preview_pages(tmp_path / "document.pdf", output_base)
+
+    assert [page.name for page in pages] == ["preview-1.png", "preview-2.png"]
+    assert not (tmp_path / "preview-9.png").exists()
+
+
 def test_runtime_settings_persist_to_config_dir(tmp_path):
     settings = Settings(data_dir=tmp_path / "data", cache_dir=tmp_path / "cache", config_dir=tmp_path / "config")
     apply_runtime_update(
@@ -48,8 +69,7 @@ def test_runtime_settings_persist_to_config_dir(tmp_path):
             history_days=7,
             cleanup_policy="manual_only",
             hotkey="Ctrl+Shift+M",
-            prompt_templates={"formula": "Formula Recognition:\nReturn LaTeX only."},
-            latex_template="TITLE={title}\n{body}\n",
+            latex_engine="lualatex",
         ),
     )
     save_runtime_settings(settings)
@@ -65,8 +85,7 @@ def test_runtime_settings_persist_to_config_dir(tmp_path):
     assert reloaded.history_days == 7
     assert reloaded.cleanup_policy == "manual_only"
     assert reloaded.hotkey == "Ctrl+Shift+M"
-    assert reloaded.prompt_templates["formula"].startswith("Formula Recognition:")
-    assert reloaded.latex_template == "TITLE={title}\n{body}\n"
+    assert reloaded.latex_engine == "lualatex"
 
 
 def test_pdf_task_rejects_missing_or_non_pdf_input(tmp_path):

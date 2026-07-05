@@ -18,16 +18,14 @@ from huggingface_hub import snapshot_download
 
 from .config import Settings, get_settings
 from .fastdeploy import FastDeployManager, FastDeployUnavailable, collect_gpu_metrics
-from .latex import conservative_repair
+from .latex import normalize_latex_document
 from .models import (
+    LatexCompileRequest,
     OCRRequest,
     OCRTaskPage,
     OCRTaskRequest,
     OCRTaskState,
     ObservabilitySnapshot,
-    RecognitionMode,
-    RepairRequest,
-    RerunBlockRequest,
     RuntimeSettings,
     RuntimeSettingsUpdate,
     ServiceState,
@@ -79,24 +77,37 @@ def summarize_latex_errors(stdout: str, stderr: str, limit: int = 5000) -> str:
     return summary[-limit:]
 
 
-def render_pdf_preview(pdf_path: Path, output_base: Path) -> Optional[Path]:
+def render_pdf_preview_pages(pdf_path: Path, output_base: Path) -> List[Path]:
     pdftoppm = shutil.which("pdftoppm")
     if not pdftoppm:
-        return None
-    output_path = output_base.with_suffix(".png")
-    if output_path.exists():
-        output_path.unlink()
+        return []
+    for stale in output_base.parent.glob(f"{output_base.name}*.png"):
+        stale.unlink()
     try:
         subprocess.run(
-            [pdftoppm, "-singlefile", "-png", "-r", "160", str(pdf_path), str(output_base)],
+            [pdftoppm, "-png", "-r", "160", "-f", "1", str(pdf_path), str(output_base)],
             text=True,
             capture_output=True,
             timeout=60,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
-    return output_path if output_path.exists() else None
+        return []
+    pages = list(output_base.parent.glob(f"{output_base.name}-*.png"))
+    pages.sort(key=pdf_preview_page_number)
+    return pages
+
+
+def render_pdf_preview(pdf_path: Path, output_base: Path) -> Optional[Path]:
+    pages = render_pdf_preview_pages(pdf_path, output_base)
+    return pages[0] if pages else None
+
+
+def pdf_preview_page_number(path: Path) -> int:
+    try:
+        return int(path.stem.rsplit("-", 1)[-1])
+    except ValueError:
+        return 0
 
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
@@ -111,9 +122,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     recent_errors: List[str] = []
     queue = asyncio.Semaphore(1)
     tasks: Dict[str, OCRTaskState] = {}
+    task_page_bodies: Dict[str, Dict[int, str]] = {}
 
     app = FastAPI(title="TeXLens Sidecar", version="0.1.0")
     app.state.ocr_tasks = tasks
+    app.state.ocr_task_page_bodies = task_page_bodies
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:1420", "tauri://localhost"],
@@ -146,7 +159,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         task = tasks[task_id]
         path = Path(request.path).expanduser()
         start = time.perf_counter()
-        page_results = []
+        page_bodies = task_page_bodies.setdefault(task_id, {})
         raw_pages: List[dict] = []
         original_copy: Optional[str] = None
         document_id: Optional[str] = None
@@ -175,15 +188,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 page_start = time.perf_counter()
                 try:
                     async with queue:
-                        page_result, raw = await asyncio.to_thread(
+                        page_body, raw = await asyncio.to_thread(
                             processor.recognize_pdf_page,
                             image_path,
                             page_number,
-                            request.mode,
-                            document_id,
                         )
-                    page_results.append(page_result)
-                    raw_pages.append({"page": page_number, "result": raw})
+                    page_bodies[page_number] = page_body[1]
+                    raw_pages.append({"page": page_number, "raw_text": raw.get("raw_text", "")})
                     page.status = "completed"
                     page.duration_ms = round((time.perf_counter() - page_start) * 1000, 2)
                 except Exception as exc:
@@ -196,14 +207,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
             if task.status != "cancelled":
                 task.status = "completed_with_errors" if task.failed_pages else "completed"
-            if page_results or task.failed_pages:
+            if page_bodies or task.failed_pages:
                 document = await asyncio.to_thread(
                     processor.save_pdf_document,
                     document_id,
                     path,
                     request.title,
                     original_copy,
-                    sorted(page_results, key=lambda item: item.page),
+                    sorted(page_bodies.items()),
                     sorted(raw_pages, key=lambda item: item.get("page", 0)),
                     start,
                     [page.model_dump(mode="json") for page in task.failed_pages],
@@ -232,9 +243,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             start = time.perf_counter()
             document_id = task.document_id or str(uuid.uuid4())
             original_copy = task.document.original_copy_path if task.document else None
-            page_results_by_number = {
-                page.page: page for page in (task.document.pages if task.document else [])
-            }
+            page_bodies = task_page_bodies.setdefault(task_id, {})
             raw_pages_by_number: Dict[int, dict] = {}
             if task.document:
                 for index, item in enumerate(task.document.raw.get("pages", []), start=1):
@@ -257,15 +266,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 page_start = time.perf_counter()
                 try:
                     async with queue:
-                        page_result, raw = await asyncio.to_thread(
+                        page_body, raw = await asyncio.to_thread(
                             processor.recognize_pdf_page,
                             Path(page.image_path),
                             page.page,
-                            task.mode,
-                            document_id,
                         )
-                    page_results_by_number[page.page] = page_result
-                    raw_pages_by_number[page.page] = {"page": page.page, "result": raw}
+                    page_bodies[page.page] = page_body[1]
+                    raw_pages_by_number[page.page] = {"page": page.page, "raw_text": raw.get("raw_text", "")}
                     page.status = "completed"
                     page.duration_ms = round((time.perf_counter() - page_start) * 1000, 2)
                 except Exception as exc:
@@ -277,14 +284,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 touch_task(task)
             if task.status != "cancelled":
                 task.status = "completed_with_errors" if task.failed_pages else "completed"
-            if page_results_by_number or task.failed_pages:
+            if page_bodies or task.failed_pages:
                 document = await asyncio.to_thread(
                     processor.save_pdf_document,
                     document_id,
                     path,
                     task.title,
                     original_copy,
-                    [page_results_by_number[key] for key in sorted(page_results_by_number)],
+                    sorted(page_bodies.items()),
                     [raw_pages_by_number[key] for key in sorted(raw_pages_by_number)],
                     start,
                     [page.model_dump(mode="json") for page in task.failed_pages],
@@ -411,12 +418,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/ocr/upload")
-    async def upload(file: UploadFile, mode: RecognitionMode = RecognitionMode.auto):
+    async def upload(file: UploadFile):
         suffix = Path(file.filename or "upload.png").suffix or ".png"
         target = settings.cache_dir / "uploads" / f"{Path(file.filename or 'upload').stem}{suffix}"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(await file.read())
-        return await recognize(OCRRequest(path=str(target), source_type="pdf" if suffix.lower() == ".pdf" else "image", mode=mode))
+        return await recognize(OCRRequest(path=str(target), source_type="pdf" if suffix.lower() == ".pdf" else "image"))
 
     @app.post("/ocr/tasks/pdf", response_model=OCRTaskState)
     async def start_pdf_task(request: OCRTaskRequest) -> OCRTaskState:
@@ -430,7 +437,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         task = OCRTaskState(
             id=task_id,
             source_path=str(path),
-            mode=request.mode,
             title=request.title or path.stem,
             created_at=now,
             updated_at=now,
@@ -474,17 +480,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         asyncio.create_task(retry_failed_pdf_pages(task_id))
         return task
 
-    @app.post("/ocr/rerun-block")
-    async def rerun_block(request: RerunBlockRequest):
-        async with queue:
-            try:
-                return await asyncio.to_thread(
-                    processor.rerun_block, request.document_id, request.block_id, request.mode
-                )
-            except Exception as exc:
-                record_error(exc)
-                raise HTTPException(status_code=500, detail=str(exc)) from exc
-
     @app.get("/history")
     def history(q: str = "", limit: int = 50):
         return storage.list_documents(q, limit)
@@ -506,19 +501,15 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             return {"deleted": 0}
         return {"deleted": storage.prune_expired()}
 
-    @app.post("/latex/repair")
-    def repair(request: RepairRequest):
-        return conservative_repair(request.latex, request.compiler_log)
-
     @app.post("/latex/compile")
-    def compile_latex(request: RepairRequest) -> Dict[str, object]:
+    def compile_latex(request: LatexCompileRequest) -> Dict[str, object]:
         engine = shutil.which("latexmk") or shutil.which(settings.latex_engine)
         if not engine:
             raise HTTPException(status_code=424, detail="No latexmk/xelatex toolchain found.")
         with tempfile.TemporaryDirectory(prefix="texlens-latex-") as tmp:
             tmp_path = Path(tmp)
             tex_path = tmp_path / "document.tex"
-            tex_path.write_text(request.latex, encoding="utf-8")
+            tex_path.write_text(normalize_latex_document(request.latex), encoding="utf-8")
             if Path(engine).name == "latexmk":
                 command = [engine, "-xelatex", "-interaction=nonstopmode", "-halt-on-error", "document.tex"]
             else:
@@ -526,11 +517,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             proc = subprocess.run(command, cwd=tmp, text=True, capture_output=True, timeout=120)
             pdf_path = tmp_path / "document.pdf"
             exported = None
-            preview_image = None
+            preview_images: List[Path] = []
             if pdf_path.exists():
                 exported = settings.export_dir / "preview.pdf"
                 shutil.copy2(pdf_path, exported)
-                preview_image = render_pdf_preview(exported, settings.export_dir / "preview")
+                preview_images = render_pdf_preview_pages(exported, settings.export_dir / "preview")
             return {
                 "ok": proc.returncode == 0,
                 "returncode": proc.returncode,
@@ -538,7 +529,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "stderr": proc.stderr[-12000:],
                 "error_summary": "" if proc.returncode == 0 else summarize_latex_errors(proc.stdout, proc.stderr),
                 "pdf_path": str(exported) if exported else None,
-                "preview_image_path": str(preview_image) if preview_image else None,
+                "preview_image_path": str(preview_images[0]) if preview_images else None,
+                "preview_image_paths": [str(path) for path in preview_images],
             }
 
     @app.get("/observability", response_model=ObservabilitySnapshot)
@@ -602,8 +594,6 @@ def runtime_settings(settings: Settings) -> RuntimeSettings:
         history_days=settings.history_days,
         cleanup_policy=settings.cleanup_policy,
         hotkey=settings.hotkey,
-        prompt_templates=settings.prompt_templates,
-        latex_template=settings.latex_template,
         latex_engine=settings.latex_engine,
     )
 
@@ -633,12 +623,6 @@ def apply_runtime_update(settings: Settings, update: RuntimeSettingsUpdate) -> N
         settings.cleanup_policy = update.cleanup_policy
     if update.hotkey:
         settings.hotkey = update.hotkey
-    if update.prompt_templates is not None:
-        settings.prompt_templates = {
-            key: value for key, value in update.prompt_templates.items() if key and value.strip()
-        }
-    if update.latex_template:
-        settings.latex_template = update.latex_template
     if update.latex_engine:
         settings.latex_engine = update.latex_engine
     settings.ensure_dirs()

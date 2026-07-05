@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from .config import Settings
+from .latex import latex_body_from_raw, normalize_latex_document, ocr_item_to_latex
 from .models import GpuMetric, ServiceState
 
 
@@ -52,6 +53,10 @@ class FastDeployManager:
     def start(self) -> ServiceState:
         if self.process and self.process.poll() is None:
             return self.status()
+        existing = self.status()
+        if existing.healthy:
+            self.last_error = None
+            return existing
         self.settings.ensure_dirs()
         command = self.launch_command()
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,7 +96,7 @@ class FastDeployManager:
         return self.start()
 
     def status(self) -> ServiceState:
-        running = bool(self.process and self.process.poll() is None)
+        process_running = bool(self.process and self.process.poll() is None)
         healthy = False
         raw_status: Dict[str, Any] = {}
         try:
@@ -104,8 +109,8 @@ class FastDeployManager:
         except Exception as exc:
             raw_status = {"error": str(exc)}
         return ServiceState(
-            running=running,
-            pid=self.process.pid if running and self.process else None,
+            running=process_running or healthy,
+            pid=self.process.pid if process_running and self.process else None,
             endpoint=self.endpoint,
             healthy=healthy,
             last_error=self.last_error,
@@ -132,19 +137,18 @@ class FastDeployClient:
         self.settings = settings
         self.manager = manager
 
-    def recognize_image(self, image_path: Path, mode: str = "auto") -> Dict[str, Any]:
+    def recognize_image(self, image_path: Path) -> Dict[str, Any]:
         self.manager.ensure_ready()
         image_bytes = image_path.read_bytes()
         mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
         encoded = base64.b64encode(image_bytes).decode("ascii")
-        prompt = prompt_for_mode(mode, self.settings.prompt_templates)
         payload = {
             "model": str(self.settings.model_dir if self.settings.model_dir.exists() else self.settings.fastdeploy_model),
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": prompt},
+                        {"type": "text", "text": ocr_prompt()},
                         {
                             "type": "image_url",
                             "image_url": {"url": f"data:{mime};base64,{encoded}"},
@@ -160,18 +164,11 @@ class FastDeployClient:
             response.raise_for_status()
             data = response.json()
         content = extract_message_content(data)
-        return parse_structured_response(content, data, mode)
+        return parse_structured_response(content, data)
 
 
-def prompt_for_mode(mode: str, templates: Optional[Dict[str, str]] = None) -> str:
-    if templates and templates.get(mode):
-        return str(templates[mode])
-    return {
-        "formula": "Formula Recognition:",
-        "table": "Table Recognition:",
-        "text": "OCR:",
-        "auto": "OCR:",
-    }.get(mode, "OCR:")
+def ocr_prompt() -> str:
+    return "OCR:"
 
 
 def extract_message_content(data: Dict[str, Any]) -> str:
@@ -185,7 +182,7 @@ def extract_message_content(data: Dict[str, Any]) -> str:
     return str(content)
 
 
-def parse_structured_response(content: str, raw: Dict[str, Any], mode: str = "auto") -> Dict[str, Any]:
+def parse_structured_response(content: str, raw: Dict[str, Any]) -> Dict[str, Any]:
     stripped = content.strip()
     if stripped.startswith("```"):
         stripped = re.sub(r"^```(?:json)?", "", stripped).strip()
@@ -193,6 +190,7 @@ def parse_structured_response(content: str, raw: Dict[str, Any], mode: str = "au
     try:
         parsed = json.loads(stripped)
         if isinstance(parsed, dict):
+            parsed["body"] = latex_body_from_raw(parsed)
             parsed.setdefault("raw_text", content)
             parsed.setdefault("raw_response", raw)
             return parsed
@@ -200,44 +198,27 @@ def parse_structured_response(content: str, raw: Dict[str, Any], mode: str = "au
         pass
     return {
         "title": "TeXLens OCR Document",
-        "blocks": plain_blocks_from_content(stripped, mode),
+        "body": plain_body_from_content(stripped),
         "raw_text": content,
         "raw_response": raw,
     }
 
 
-def plain_blocks_from_content(content: str, mode: str) -> List[Dict[str, Any]]:
-    if mode in {"formula", "table", "text"}:
-        block_type = infer_block_type(content, mode)
-        return [plain_block("b1", block_type, content)]
-
+def plain_body_from_content(content: str) -> str:
     chunks = [chunk.strip() for chunk in re.split(r"\n\s*\n", content) if chunk.strip()]
     if not chunks:
-        return [plain_block("b1", "paragraph", content)]
+        return ocr_item_to_latex({"type": "paragraph", "text": content, "latex": content})
 
-    blocks: List[Dict[str, Any]] = []
+    parts: List[str] = []
     for index, chunk in enumerate(chunks, start=1):
-        block_type = infer_block_type(chunk, mode)
-        if block_type == "paragraph" and index == 1 and is_likely_title(chunk):
-            block_type = "title"
-        blocks.append(plain_block(f"b{index}", block_type, chunk))
-    return blocks
+        content_type = infer_content_type(chunk)
+        if content_type == "paragraph" and index == 1 and is_likely_title(chunk):
+            content_type = "title"
+        parts.append(ocr_item_to_latex({"type": content_type, "text": chunk, "latex": chunk}))
+    return normalize_latex_document("\n\n".join(part for part in parts if part.strip())).strip()
 
 
-def plain_block(block_id: str, block_type: str, content: str) -> Dict[str, Any]:
-    return {
-        "id": block_id,
-        "type": block_type,
-        "bbox": [0, 0, 1, 1],
-        "text": content,
-        "latex": content,
-        "confidence": None,
-    }
-
-
-def infer_block_type(content: str, mode: str) -> str:
-    if mode in {"formula", "table", "text"}:
-        return "paragraph" if mode == "text" else mode
+def infer_content_type(content: str) -> str:
     if re.search(r"<(?:fcel|ecel|ucel|lcel|xcel)>|<nl>", content) or looks_like_pipe_table(content):
         return "table"
     if looks_like_formula(content):
@@ -257,7 +238,7 @@ def looks_like_pipe_table(content: str) -> bool:
 def looks_like_formula(content: str) -> bool:
     stripped = content.strip()
     return bool(
-        re.search(r"\\begin\{(?:aligned|align\*?|array|equation\*?)\}|^\\\[", stripped)
+        re.search(r"\\begin\{(?:aligned|align\*?|array|equation\*?)\}|^\\\[|^\$\$", stripped)
         or re.search(r"(^|\n)\s*[^|\n]{0,80}&=", stripped)
         or re.search(r"\\(?:frac|int|sum|prod|sqrt|lim|alpha|beta|gamma|theta|infty)\b", stripped)
     )

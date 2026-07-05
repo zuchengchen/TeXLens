@@ -8,6 +8,7 @@ The OCR backend is intentionally strict: TeXLens does not fall back to another O
 
 - Linux/Manjaro first.
 - X11 screenshot and global hotkey first.
+- Linux tray icon with XEmbed fallback for X11+i3 and StatusNotifier/AppIndicator elsewhere.
 - Wayland displays a limitation message for screenshot capture.
 - Recognition is local. No account, cloud sync, or online OCR.
 - Model download is user-triggered from the app or sidecar API.
@@ -37,14 +38,17 @@ start it creates a writable uv environment at `~/.cache/texlens/sidecar-venv` an
 process logs to `~/.cache/texlens/sidecar.log`.
 
 Runtime settings are stored in `~/.config/texlens/settings.json`. The settings page exposes
-the FastDeploy launch args, screenshot hotkey, history cleanup policy, LaTeX engine, native
-PaddleOCR-VL prompt templates, and the document LaTeX template used for export.
+the FastDeploy launch args, screenshot hotkey, history cleanup policy, and LaTeX engine.
+Recognition uses TeXLens' fixed PaddleOCR-VL prompt and fixed internal `ctexart` export
+template.
 
 PDF import runs as a sidecar background task: pages are rendered, recognized one-by-one
 through FastDeploy, cancellable, retryable per failed page, and exported as one merged
-LaTeX document. Plain PaddleOCR-VL text responses are post-processed into blocks, with
-Markdown-style tables converted to `tabular` and multi-line formulas normalized to
-compilable `align*` where possible.
+LaTeX document. The final document exposes document-level `body` and full `latex` source:
+the workbench edits only the body, while Copy LaTeX copies the body and Save TeX writes
+the complete template-wrapped `.tex` file. Markdown-style tables are converted to
+`tabular` and multi-line formulas are normalized to compilable `equation` environments
+with inner `aligned` environments where needed.
 
 ## Verification
 
@@ -62,7 +66,7 @@ pnpm tauri:build
 `pnpm verify` runs the main local verification sequence, including lint, unit tests,
 sidecar tests, OCR benchmark, performance recording, and AppImage build.
 
-`pnpm ocr:bench` records readiness and produces a report. Full OCR quality acceptance still requires a running PaddleOCR-VL FastDeploy service and manual review of formulas, tables, and block correction.
+`pnpm ocr:bench` records readiness and produces a report. Full OCR quality acceptance still requires a running PaddleOCR-VL FastDeploy service and manual review of formulas, tables, and body editing.
 
 On current Manjaro/Arch systems, AppImage bundling uses `NO_STRIP=1` to avoid linuxdeploy's older strip binary failing on `.relr.dyn` sections in system libraries.
 

@@ -15,22 +15,16 @@ SAMPLES = [
     {
         "name": "formula",
         "file": "formula-derivation.png",
-        "mode": "formula",
-        "expected_block_type": "formula",
         "latex_contains": ["\\documentclass", "\\begin"],
     },
     {
         "name": "table",
         "file": "table-page.png",
-        "mode": "table",
-        "expected_block_type": "table",
         "latex_contains": ["\\begin{tabular}", "Method"],
     },
     {
         "name": "mixed",
         "file": "mixed-zh-en-page.png",
-        "mode": "auto",
-        "expected_block_type": None,
         "latex_contains": ["\\documentclass", "TeXLens"],
     },
 ]
@@ -87,7 +81,6 @@ def run_samples(
             json={
                 "path": str(image_path),
                 "source_type": "image",
-                "mode": sample["mode"],
                 "title": f"bench-{sample['name']}",
             },
         )
@@ -96,11 +89,10 @@ def run_samples(
         output_path = out_dir / f"{sample['name']}.json"
         output_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         latex = payload.get("latex", "") if isinstance(payload, dict) else ""
-        block_types = block_types_from_payload(payload)
         compile_result = compile_latex(client, base_url, latex)
         checks = {
             "http_ok": response.status_code == 200,
-            "expected_block_type": block_type_ok(block_types, sample["expected_block_type"]),
+            "body_present": bool(payload.get("body")) if isinstance(payload, dict) else False,
             "latex_contains": all(token in latex for token in sample["latex_contains"]),
             "compile_ok": bool(compile_result.get("ok")),
         }
@@ -108,10 +100,8 @@ def run_samples(
             {
                 "name": sample["name"],
                 "path": str(image_path),
-                "mode": sample["mode"],
                 "duration_ms": duration_ms,
                 "document_id": payload.get("id") if isinstance(payload, dict) else None,
-                "block_types": block_types,
                 "metrics": payload.get("metrics") if isinstance(payload, dict) else None,
                 "checks": checks,
                 "compile": compile_result,
@@ -121,25 +111,6 @@ def run_samples(
             }
         )
     return results
-
-
-def block_types_from_payload(payload: Any) -> List[str]:
-    if not isinstance(payload, dict):
-        return []
-    block_types: List[str] = []
-    for page in payload.get("pages", []):
-        if not isinstance(page, dict):
-            continue
-        for block in page.get("blocks", []):
-            if isinstance(block, dict):
-                block_types.append(str(block.get("block_type") or "unknown"))
-    return block_types
-
-
-def block_type_ok(block_types: List[str], expected: object) -> bool:
-    if expected is None:
-        return bool(block_types)
-    return str(expected) in block_types
 
 
 def compile_latex(client: httpx.Client, base_url: str, latex: str) -> Dict[str, Any]:

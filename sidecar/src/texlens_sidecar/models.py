@@ -1,46 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
-
-
-class BlockType(str, Enum):
-    title = "title"
-    paragraph = "paragraph"
-    formula = "formula"
-    table = "table"
-    image = "image"
-    unknown = "unknown"
-
-
-class RecognitionMode(str, Enum):
-    auto = "auto"
-    formula = "formula"
-    table = "table"
-    text = "text"
-
-
-class OCRBlock(BaseModel):
-    id: str
-    page: int = 1
-    block_type: BlockType = BlockType.unknown
-    bbox: List[float] = Field(default_factory=lambda: [0, 0, 1, 1])
-    text: str = ""
-    latex: str = ""
-    confidence: Optional[float] = None
-    crop_path: Optional[str] = None
-    raw: Dict[str, Any] = Field(default_factory=dict)
-
-
-class PageResult(BaseModel):
-    page: int
-    image_path: Optional[str] = None
-    width: Optional[int] = None
-    height: Optional[int] = None
-    blocks: List[OCRBlock] = Field(default_factory=list)
 
 
 class DocumentResult(BaseModel):
@@ -51,7 +14,7 @@ class DocumentResult(BaseModel):
     created_at: datetime
     updated_at: datetime
     status: str = "completed"
-    pages: List[PageResult] = Field(default_factory=list)
+    body: str = ""
     latex: str = ""
     raw: Dict[str, Any] = Field(default_factory=dict)
     thumbnail_path: Optional[str] = None
@@ -62,13 +25,11 @@ class DocumentResult(BaseModel):
 class OCRRequest(BaseModel):
     path: str
     source_type: str = "image"
-    mode: RecognitionMode = RecognitionMode.auto
     title: Optional[str] = None
 
 
 class OCRTaskRequest(BaseModel):
     path: str
-    mode: RecognitionMode = RecognitionMode.auto
     title: Optional[str] = None
 
 
@@ -84,7 +45,6 @@ class OCRTaskState(BaseModel):
     id: str
     source_path: str
     source_type: str = "pdf"
-    mode: RecognitionMode = RecognitionMode.auto
     title: Optional[str] = None
     status: str = "pending"
     current_page: Optional[int] = None
@@ -100,22 +60,8 @@ class OCRTaskState(BaseModel):
     updated_at: datetime
 
 
-class RerunBlockRequest(BaseModel):
-    document_id: str
-    block_id: str
-    mode: RecognitionMode = RecognitionMode.auto
-
-
-class RepairRequest(BaseModel):
+class LatexCompileRequest(BaseModel):
     latex: str
-    compiler_log: str = ""
-
-
-class RepairSuggestion(BaseModel):
-    original: str
-    repaired: str
-    changes: List[str] = Field(default_factory=list)
-    requires_confirmation: bool = True
 
 
 class ServiceState(BaseModel):
@@ -151,8 +97,6 @@ class RuntimeSettings(BaseModel):
     history_days: int
     cleanup_policy: str
     hotkey: str
-    prompt_templates: Dict[str, str] = Field(default_factory=dict)
-    latex_template: str
     latex_engine: str
 
 
@@ -163,6 +107,4 @@ class RuntimeSettingsUpdate(BaseModel):
     history_days: Optional[int] = None
     cleanup_policy: Optional[str] = None
     hotkey: Optional[str] = None
-    prompt_templates: Optional[Dict[str, str]] = None
-    latex_template: Optional[str] = None
     latex_engine: Optional[str] = None

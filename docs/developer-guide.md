@@ -4,14 +4,15 @@
 
 ```text
 Tauri/Rust
-  Native window, X11 screenshot, global shortcut, clipboard, dialogs, sidecar lifecycle
+  Native window, StatusNotifier tray, close-to-tray behavior, X11 screenshot,
+  global shortcut, clipboard, dialogs, sidecar lifecycle
 
 React/TypeScript
-  Workbench, block correction, Monaco editor, history, settings, observability
+  Workbench, source preview, Monaco body editor, history, settings, observability
 
 Python sidecar
   FastDeploy process manager, OpenAI-compatible PaddleOCR-VL calls, SQLite history,
-  LaTeX generation, conservative repair, metrics, model download
+  LaTeX body generation, compile preview support, metrics, model download
 
 FastDeploy
   PaddleOCR-VL-1.6 VLM service
@@ -84,23 +85,16 @@ UV_SKIP_WHEEL_FILENAME_CHECK=1 uv pip install --python .fastdeploy-venv/bin/pyth
 model registry. The sidecar `/environment` endpoint reports whether `pip`, `fastdeploy`,
 `paddle`, and `paddleformers` are visible from the FastDeploy Python.
 
-TeXLens sends PaddleOCR-VL's native task prompts through FastDeploy:
-`OCR:`, `Formula Recognition:`, and `Table Recognition:`. Native table cell streams such as
-`<fcel>...<nl>` and Markdown-style pipe tables are converted to LaTeX `tabular` during
-document assembly. Plain FastDeploy text responses are split into title, formula, table,
-and paragraph blocks when the structure is obvious. Multi-line formula blocks are wrapped
-with `align*`, line separators are inserted when missing, and doubled command slashes such
-as `\\infty` are normalized before compile preview.
+TeXLens sends PaddleOCR-VL's native `OCR:` prompt through FastDeploy. Native table cell
+streams such as `<fcel>...<nl>` and Markdown-style pipe tables are converted to LaTeX
+`tabular` during body generation. Plain FastDeploy text responses are converted into one
+document-level LaTeX body. Formula-like content is wrapped with `equation`; multi-line
+formula content uses an inner `aligned` environment, line separators are inserted when
+missing, and doubled command slashes such as `\\infty` are normalized before compile
+preview.
 
-Prompt selection is runtime-configurable through `Settings.prompt_templates`. The sidecar
-looks up the active recognition mode first (`auto`, `formula`, `table`, or `text`) and
-falls back to PaddleOCR-VL's native prompts when a template is missing. The frontend sends
-the complete prompt map from the settings page, while API callers may update only the
-entries they need.
-
-LaTeX assembly is also runtime-configurable. `Settings.latex_template` is rendered with
-`{title}` and `{body}` placeholders. `{body}` is required for a custom template to be used;
-when it is missing, the renderer falls back to the default `ctexart` template.
+LaTeX export uses a fixed internal `ctexart` template. The frontend edits only the body;
+Copy LaTeX copies the body, and Save TeX writes the full template-wrapped source.
 
 Runtime settings are persisted as JSON in `~/.config/texlens/settings.json` unless
 `TEXLENS_CONFIG_DIR` or XDG config variables point elsewhere.
@@ -117,9 +111,8 @@ Core local endpoints:
 - `GET /fastdeploy/status`, `GET /fastdeploy/logs`
 - `POST /ocr/recognize`
 - `POST /ocr/upload`
-- `POST /ocr/rerun-block`
 - `GET /history`, `GET /history/{document_id}`, `DELETE /history`, `POST /history/prune`
-- `POST /latex/repair`, `POST /latex/compile`
+- `POST /latex/compile`
 - `GET /observability`
 
 PDF task endpoints:
@@ -153,13 +146,6 @@ Task summaries also appear in `/observability` under `cache.tasks`.
   "history_days": 30,
   "cleanup_policy": "history_ttl",
   "hotkey": "Ctrl+Alt+M",
-  "prompt_templates": {
-    "auto": "OCR:",
-    "formula": "Formula Recognition:",
-    "table": "Table Recognition:",
-    "text": "OCR:"
-  },
-  "latex_template": "\\documentclass[UTF8]{ctexart}\n{body}\n\\end{document}\n",
   "latex_engine": "xelatex"
 }
 ```
@@ -167,17 +153,16 @@ Task summaries also appear in `/observability` under `cache.tasks`.
 `cleanup_policy` accepts `history_ttl` and `manual_only`. With `manual_only`, `/history/prune`
 returns without deleting history; users must clear history explicitly.
 
-## Block Model
+## Document Model
 
-Each OCR block stores:
+Final OCR documents expose document-level fields:
 
-- Stable block id.
-- Page number.
-- Type: title, paragraph, formula, table, image, unknown.
-- Normalized bounding box.
-- Text and LaTeX.
-- Confidence when available.
-- Source crop path for re-recognition.
-- Raw PaddleOCR-VL/FastDeploy JSON.
+- `id`, `title`, `source_type`, `source_path`, timestamps, and status.
+- `body`: the editable LaTeX body shown in Monaco.
+- `latex`: complete source produced by wrapping `body` in the fixed internal template.
+- `original_copy_path` and `thumbnail_path` when available.
+- `metrics` and a small raw payload for diagnostics.
 
-The full document is assembled from blocks in reading order.
+PDF OCR tasks still expose page progress through `total_pages`, `current_page`,
+`completed_pages`, `pages`, and `failed_pages`, but completed documents do not expose
+page/block structures.

@@ -1,17 +1,16 @@
-import Editor, { DiffEditor } from "@monaco-editor/react";
+import Editor from "@monaco-editor/react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { register, unregisterAll } from "@tauri-apps/plugin-global-shortcut";
 import {
   Activity,
-  Check,
   Clipboard,
   Database,
   Download,
   FileText,
-  Gauge,
   History,
   Image,
-  Play,
   RefreshCcw,
   Save,
   Scissors,
@@ -19,10 +18,8 @@ import {
   Settings,
   Square,
   Trash2,
-  Wand2,
-  X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   captureRegion,
   cancelOcrTask,
@@ -40,9 +37,6 @@ import {
   listHistory,
   recognizePath,
   reloadFastDeploy,
-  repairLatex,
-  renderPdfPreview,
-  rerunBlock,
   retryFailedOcrTask,
   saveLatexFile,
   startPdfTask,
@@ -54,11 +48,11 @@ import {
 } from "./api";
 import { useAppStore } from "./store";
 import type {
+  DocumentResult,
+  GpuMetric,
   LatexCompileResult,
-  OCRBlock,
   OCRTaskState,
-  RecognitionMode,
-  RepairSuggestion,
+  ObservabilitySnapshot,
   RuntimeSettings,
 } from "./types";
 import { testBridge } from "./testBridge";
@@ -71,37 +65,47 @@ const navItems = [
   ["settings", Settings, "设置"],
 ] as const;
 
+const autoCompileDelayMs = 1500;
+const sidecarPollIntervalMs = 350;
+const sidecarReadyTimeoutMs = 120000;
+const fastDeployPollIntervalMs = 3000;
+const fastDeployReadyTimeoutMs = 180000;
+const trayCaptureEvent = "texlens-tray-capture";
+
+type CompilePreviewState = {
+  status: "idle" | "loading" | "success" | "error";
+  result?: LatexCompileResult;
+  error?: string;
+  trigger?: "auto" | "manual";
+  cacheKey?: number;
+};
+
 export default function App() {
   const [view, setView] = useState<(typeof navItems)[number][0]>("workbench");
   const [historyQuery, setHistoryQuery] = useState("");
   const [modelState, setModelState] = useState<Record<string, unknown>>({});
   const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings>();
-  const [repairSuggestion, setRepairSuggestion] = useState<RepairSuggestion>();
-  const [compileResult, setCompileResult] = useState<LatexCompileResult>();
+  const [compilePreview, setCompilePreview] = useState<CompilePreviewState>({ status: "idle" });
   const [fastDeployLog, setFastDeployLog] = useState("");
   const [pdfTask, setPdfTask] = useState<OCRTaskState>();
+  const compileRequestId = useRef(0);
+  const compilePreviewDocumentId = useRef<string | undefined>(undefined);
+  const autoStartedServices = useRef(false);
   const {
     activeDocument,
-    selectedBlockId,
     environment,
     observability,
-    mode,
     busy,
     error,
     setActiveDocument,
-    selectBlock,
-    updateSelectedBlockLatex,
+    updateActiveDocumentBody,
     setEnvironment,
     setObservability,
     setHistory,
-    setMode,
     setBusy,
     setError,
   } = useAppStore();
 
-  const selectedBlock = useMemo(() => {
-    return activeDocument?.pages.flatMap((page) => page.blocks).find((block) => block.id === selectedBlockId);
-  }, [activeDocument, selectedBlockId]);
   const activeHotkey = runtimeSettings?.hotkey?.trim() || defaultHotkey;
   const registeredHotkey = normalizeGlobalShortcut(activeHotkey, defaultHotkey);
 
@@ -115,6 +119,13 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function refreshObservabilityAndLogs(): Promise<ObservabilitySnapshot> {
+    const [obs, logs] = await Promise.all([getObservability(), getFastDeployLogs().catch(() => undefined)]);
+    setObservability(obs);
+    if (logs) setFastDeployLog(logs.log);
+    return obs;
   }
 
   async function refreshAll() {
@@ -138,18 +149,93 @@ export default function App() {
 
   async function ensureSidecar() {
     await startSidecar();
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    await waitForSidecarReady();
   }
 
-  async function captureAndRecognize() {
+  async function waitForSidecarReady() {
+    const deadline = Date.now() + sidecarReadyTimeoutMs;
+    let lastError: unknown;
+    while (Date.now() < deadline) {
+      try {
+        await refreshObservabilityAndLogs();
+        return;
+      } catch (err) {
+        lastError = err;
+        await sleep(sidecarPollIntervalMs);
+      }
+    }
+    throw new Error(`Sidecar did not become ready: ${errorMessage(lastError)}`);
+  }
+
+  async function startFastDeployAndRefresh() {
+    await ensureSidecar();
+    const started = await startFastDeploy();
+    setObservability({ ...(observability ?? emptyObservability()), service: started });
+    const refreshed = await refreshObservabilityAndLogs();
+    const service = await pollFastDeployReadiness(refreshed.service);
+    if (!service?.healthy) {
+      throw new Error("FastDeploy started but did not become healthy yet. Open Observability and check FastDeploy Log.");
+    }
+  }
+
+  async function stopFastDeployAndRefresh() {
+    await ensureSidecar();
+    await stopFastDeploy();
+    await refreshObservabilityAndLogs();
+  }
+
+  async function reloadFastDeployAndRefresh() {
+    await ensureSidecar();
+    const started = await reloadFastDeploy();
+    setObservability({ ...(observability ?? emptyObservability()), service: started });
+    const refreshed = await refreshObservabilityAndLogs();
+    const service = await pollFastDeployReadiness(refreshed.service);
+    if (!service?.healthy) {
+      throw new Error("FastDeploy reloaded but did not become healthy yet. Open Observability and check FastDeploy Log.");
+    }
+  }
+
+  async function pollFastDeployReadiness(initial?: ObservabilitySnapshot["service"]) {
+    let service = initial;
+    const deadline = Date.now() + fastDeployReadyTimeoutMs;
+    while (!service?.healthy && Date.now() < deadline) {
+      if (service && !service.running) break;
+      await sleep(fastDeployPollIntervalMs);
+      service = (await refreshObservabilityAndLogs()).service;
+    }
+    return service;
+  }
+
+  async function autoStartServices() {
+    if (!hasTauriRuntime() || testBridge()?.skipSidecar || autoStartedServices.current) return;
+    autoStartedServices.current = true;
+    try {
+      await startFastDeployAndRefresh();
+    } catch (err) {
+      setError(`后台启动 OCR 服务失败: ${errorMessage(err)}`);
+    }
+  }
+
+  async function revealMainWindow() {
+    if (!hasTauriRuntime()) return;
+    const window = getCurrentWebviewWindow();
+    await window.unminimize();
+    await window.show();
+    await window.setFocus();
+  }
+
+  async function captureAndRecognize(revealAfterCapture = false) {
     await guarded(async () => {
       await ensureSidecar();
       const capture = await captureRegion();
-      const document = await recognizePath(capture.path, mode);
+      const document = await recognizePath(capture.path);
       setActiveDocument(document);
       setHistory(await listHistory(historyQuery));
       setView("workbench");
     });
+    if (revealAfterCapture) {
+      await revealMainWindow().catch((err) => console.warn("Unable to reveal TeXLens after tray capture", err));
+    }
   }
 
   async function importAndRecognize() {
@@ -159,7 +245,7 @@ export default function App() {
       if (!path) return;
       if (path.toLowerCase().endsWith(".pdf")) {
         setView("workbench");
-        const task = await startPdfTask(path, mode);
+        const task = await startPdfTask(path);
         setPdfTask(task);
         const completed = await pollOcrTask(task.id);
         if (completed.document) {
@@ -169,7 +255,7 @@ export default function App() {
         return;
       }
       setPdfTask(undefined);
-      const document = await recognizePath(path, mode);
+      const document = await recognizePath(path);
       setActiveDocument(document);
       setHistory(await listHistory(historyQuery));
       setView("workbench");
@@ -205,44 +291,46 @@ export default function App() {
     });
   }
 
-  async function repairCurrentLatex() {
-    if (!activeDocument) return;
-    await guarded(async () => {
-      const compilerLog = [compileResult?.error_summary, compileResult?.stdout, compileResult?.stderr]
-        .filter(Boolean)
-        .join("\n");
-      const suggestion = await repairLatex(activeDocument.latex, compilerLog);
-      setRepairSuggestion(suggestion);
-      setError(suggestion.changes.join(" "));
-    });
-  }
+  const compileDocumentPreview = useCallback(
+    async (trigger: "auto" | "manual" = "auto") => {
+      if (!activeDocument) {
+        compileRequestId.current += 1;
+        setCompilePreview({ status: "idle" });
+        return;
+      }
 
-  function applyRepairSuggestion() {
-    if (!activeDocument || !repairSuggestion) return;
-    setActiveDocument({ ...activeDocument, latex: repairSuggestion.repaired });
-    setRepairSuggestion(undefined);
-    setCompileResult(undefined);
-  }
+      const requestId = ++compileRequestId.current;
+      const latex = activeDocument.latex;
+      setCompilePreview((current) => ({
+        status: "loading",
+        result: current.status === "error" ? undefined : current.result,
+        trigger,
+        cacheKey: current.cacheKey,
+      }));
+
+      try {
+        const result = await compileLatex(latex);
+        if (requestId !== compileRequestId.current) return;
+        if (!result.ok) {
+          const message = compileLog(result) || "LaTeX compile failed.";
+          setCompilePreview({ status: "error", result, error: message, trigger });
+          if (trigger === "manual") setError(message);
+          return;
+        }
+        setCompilePreview({ status: "success", result, trigger, cacheKey: requestId });
+        if (trigger === "manual") setError(undefined);
+      } catch (err) {
+        if (requestId !== compileRequestId.current) return;
+        const message = err instanceof Error ? err.message : String(err);
+        setCompilePreview({ status: "error", error: message, trigger });
+        if (trigger === "manual") setError(message);
+      }
+    },
+    [activeDocument, setError],
+  );
 
   async function compileCurrentLatex() {
-    if (!activeDocument) return;
-    await guarded(async () => {
-      let result = await compileLatex(activeDocument.latex);
-      if (result.pdf_path && !result.preview_image_path) {
-        const preview = await renderPdfPreview(result.pdf_path);
-        if (preview) result = { ...result, preview_image_path: preview.path };
-      }
-      setCompileResult(result);
-      setError(result.ok ? undefined : compileLog(result));
-    });
-  }
-
-  async function rerunSelectedBlock(modeOverride: RecognitionMode) {
-    if (!activeDocument || !selectedBlock) return;
-    await guarded(async () => {
-      const document = await rerunBlock(activeDocument.id, selectedBlock.id, modeOverride);
-      setActiveDocument(document);
-    });
+    await compileDocumentPreview("manual");
   }
 
   useEffect(() => {
@@ -251,7 +339,8 @@ export default function App() {
       setActiveDocument(bridge.initialDocument);
       setHistory([bridge.initialDocument]);
     }
-    refreshAll();
+    void refreshAll();
+    void autoStartServices();
     const timer = window.setInterval(() => {
       getObservability().then(setObservability).catch(() => undefined);
     }, 3000);
@@ -259,6 +348,25 @@ export default function App() {
     // The initial boot pass intentionally runs once; the interval owns later observability refreshes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!activeDocument?.latex) {
+      compileRequestId.current += 1;
+      compilePreviewDocumentId.current = undefined;
+      setCompilePreview({ status: "idle" });
+      return;
+    }
+    const isNewDocument = compilePreviewDocumentId.current !== activeDocument.id;
+    compilePreviewDocumentId.current = activeDocument.id;
+    compileRequestId.current += 1;
+    if (isNewDocument) {
+      setCompilePreview({ status: "loading", trigger: "auto" });
+    }
+    const timer = window.setTimeout(() => {
+      void compileDocumentPreview("auto");
+    }, autoCompileDelayMs);
+    return () => window.clearTimeout(timer);
+  }, [activeDocument?.id, activeDocument?.latex, compileDocumentPreview]);
 
   useEffect(() => {
     if (!hasTauriRuntime()) return;
@@ -276,9 +384,32 @@ export default function App() {
       mounted = false;
       unregisterAll().catch((err) => console.warn("Global shortcut cleanup failed", err));
     };
-    // Shortcut registration tracks the active recognition mode through the capture closure.
+    // The capture closure reads current settings and history state when invoked.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, registeredHotkey]);
+  }, [registeredHotkey]);
+
+  useEffect(() => {
+    if (!hasTauriRuntime()) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen(trayCaptureEvent, () => {
+      void captureAndRecognize(true);
+    }).then((cleanup) => {
+      if (disposed) {
+        cleanup();
+        return;
+      }
+      unlisten = cleanup;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+    // Tray capture tracks the active history query through the capture closure.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historyQuery]);
+
+  const sidebarGpu = displayGpuMetric(observability);
 
   return (
     <div className="app-shell">
@@ -300,33 +431,21 @@ export default function App() {
         </nav>
         <div className="status-strip">
           <span>GPU</span>
-          <strong>{observability?.gpu[0]?.memory_used_mib ?? "-"} MiB</strong>
+          <strong>{formatGpuMemory(sidebarGpu.metric, sidebarGpu.isRecent)}</strong>
         </div>
       </aside>
 
       <main>
         <header className="topbar">
-          <div className="segmented">
-            {(["auto", "formula", "table", "text"] as RecognitionMode[]).map((item) => (
-              <button key={item} className={mode === item ? "active" : ""} onClick={() => setMode(item)}>
-                {item}
-              </button>
-            ))}
+          <div className="topbar-title">
+            <strong>工作台</strong>
+            <span>自动识别为可编辑 LaTeX 正文</span>
           </div>
           <div className="toolbar">
-            <button title="Start sidecar" onClick={() => guarded(ensureSidecar)}>
-              <Play size={18} />
-            </button>
-            <button title="Start FastDeploy" onClick={() => guarded(async () => void (await startFastDeploy()))}>
-              <Gauge size={18} />
-            </button>
-            <button title="Stop FastDeploy" onClick={() => guarded(async () => void (await stopFastDeploy()))}>
-              <Square size={18} />
-            </button>
             <button title="Refresh" onClick={refreshAll}>
               <RefreshCcw size={18} />
             </button>
-            <button className="primary" title="Capture" onClick={captureAndRecognize}>
+            <button className="primary" title="Capture" onClick={() => void captureAndRecognize()}>
               <Scissors size={18} />
               <span>截图</span>
             </button>
@@ -343,21 +462,13 @@ export default function App() {
         {view === "workbench" && (
           <Workbench
             pdfTask={pdfTask}
-            selectedBlock={selectedBlock}
-            onSelectBlock={selectBlock}
-            onBlockLatex={updateSelectedBlockLatex}
-            onCopy={() => activeDocument && writeClipboard(activeDocument.latex)}
+            onBodyLatex={updateActiveDocumentBody}
+            onCopy={() => activeDocument && writeClipboard(activeDocument.body)}
             onSave={() => activeDocument && saveLatexFile(activeDocument.title, activeDocument.latex)}
-            compileResult={compileResult}
-            repairSuggestion={repairSuggestion}
+            compilePreview={compilePreview}
             onCompile={compileCurrentLatex}
-            onRepair={repairCurrentLatex}
-            onApplyRepair={applyRepairSuggestion}
-            onDiscardRepair={() => setRepairSuggestion(undefined)}
-            onClosePreview={() => setCompileResult(undefined)}
             onCancelPdfTask={cancelPdfTask}
             onRetryFailedPdfTask={retryFailedPdfTask}
-            onRerun={rerunSelectedBlock}
           />
         )}
         {view === "history" && (
@@ -366,19 +477,20 @@ export default function App() {
             onQuery={setHistoryQuery}
             onSearch={() => listHistory(historyQuery).then(setHistory).catch((err) => setError(String(err)))}
             onClear={() => guarded(async () => void (await clearHistory()).deleted)}
+            onOpen={(document) => {
+              setActiveDocument(document);
+              setView("workbench");
+            }}
           />
         )}
         {view === "observability" && (
           <ObservabilityView
             fastDeployLog={fastDeployLog}
-            onStart={() => guarded(async () => setObservability({ ...(observability ?? emptyObservability()), service: await startFastDeploy() }))}
-            onStop={() => guarded(async () => setObservability({ ...(observability ?? emptyObservability()), service: await stopFastDeploy() }))}
-            onReload={() => guarded(async () => setObservability({ ...(observability ?? emptyObservability()), service: await reloadFastDeploy() }))}
+            onStop={() => guarded(stopFastDeployAndRefresh)}
+            onReload={() => guarded(reloadFastDeployAndRefresh)}
             onRefresh={() =>
               guarded(async () => {
-                const [obs, logs] = await Promise.all([getObservability(), getFastDeployLogs()]);
-                setObservability(obs);
-                setFastDeployLog(logs.log);
+                await refreshObservabilityAndLogs();
               })
             }
           />
@@ -390,7 +502,7 @@ export default function App() {
             environment={environment}
             onDownloadModel={() => guarded(async () => setModelState(await downloadModel()))}
             onSaveSettings={(update) => guarded(async () => setRuntimeSettings(await updateRuntimeSettings(update)))}
-            onReloadFastDeploy={() => guarded(async () => void (await reloadFastDeploy()))}
+            onReloadFastDeploy={() => guarded(reloadFastDeployAndRefresh)}
             onStatus={() => guarded(async () => setObservability({ ...(observability ?? emptyObservability()), service: await getFastDeployStatus() }))}
           />
         )}
@@ -401,43 +513,26 @@ export default function App() {
 
 function Workbench({
   pdfTask,
-  selectedBlock,
-  onSelectBlock,
-  onBlockLatex,
+  onBodyLatex,
   onCopy,
   onSave,
-  compileResult,
-  repairSuggestion,
+  compilePreview,
   onCompile,
-  onRepair,
-  onApplyRepair,
-  onDiscardRepair,
-  onClosePreview,
   onCancelPdfTask,
   onRetryFailedPdfTask,
-  onRerun,
 }: {
   pdfTask?: OCRTaskState;
-  selectedBlock?: OCRBlock;
-  onSelectBlock: (blockId?: string) => void;
-  onBlockLatex: (latex: string) => void;
+  onBodyLatex: (latex: string) => void;
   onCopy: () => void;
   onSave: () => void;
-  compileResult?: LatexCompileResult;
-  repairSuggestion?: RepairSuggestion;
+  compilePreview: CompilePreviewState;
   onCompile: () => void;
-  onRepair: () => void;
-  onApplyRepair: () => void;
-  onDiscardRepair: () => void;
-  onClosePreview: () => void;
   onCancelPdfTask: () => void;
   onRetryFailedPdfTask: () => void;
-  onRerun: (mode: RecognitionMode) => void;
 }) {
   const { activeDocument } = useAppStore();
-  const firstPage = activeDocument?.pages[0];
   return (
-    <section className="workspace">
+    <section className={`workspace ${pdfTask ? "has-task" : ""}`}>
       {pdfTask && (
         <PdfTaskPanel
           task={pdfTask}
@@ -446,43 +541,8 @@ function Workbench({
         />
       )}
       <div className="page-view">
-        {firstPage?.image_path ? (
-          <div className="image-stage">
-            <img src={fileUrl(firstPage.image_path)} alt="" />
-            {firstPage.blocks.map((block) => (
-              <button
-                key={block.id}
-                className={`block-box ${block.id === selectedBlock?.id ? "selected" : ""}`}
-                style={{
-                  left: `${block.bbox[0] * 100}%`,
-                  top: `${block.bbox[1] * 100}%`,
-                  width: `${(block.bbox[2] - block.bbox[0]) * 100}%`,
-                  height: `${(block.bbox[3] - block.bbox[1]) * 100}%`,
-                }}
-                title={block.block_type}
-                onClick={() => onSelectBlock(block.id)}
-              />
-            ))}
-          </div>
-        ) : (
-          <div className="empty-panel">
-            <FileText size={42} />
-            <strong>等待识别任务</strong>
-          </div>
-        )}
-      </div>
-      <div className="block-list">
-        <div className="panel-title">Blocks</div>
-        {activeDocument?.pages.flatMap((page) => page.blocks).map((block) => (
-          <button
-            key={block.id}
-            className={block.id === selectedBlock?.id ? "active" : ""}
-            onClick={() => onSelectBlock(block.id)}
-          >
-            <span>{block.block_type}</span>
-            <strong>{block.latex.slice(0, 80) || block.text.slice(0, 80) || block.id}</strong>
-          </button>
-        ))}
+        <SourcePreviewPanel document={activeDocument} />
+        <CompiledPreviewPanel state={compilePreview} />
       </div>
       <div className="editor-column">
         <div className="panel-actions">
@@ -495,71 +555,162 @@ function Workbench({
           <button title="Compile preview" onClick={onCompile}>
             <FileText size={18} />
           </button>
-          <button title="Repair" onClick={onRepair}>
-            <Wand2 size={18} />
-          </button>
-          <button title="Rerun formula" onClick={() => onRerun("formula")}>
-            formula
-          </button>
-          <button title="Rerun table" onClick={() => onRerun("table")}>
-            table
-          </button>
         </div>
         <Editor
-          height="42vh"
+          height="100%"
           language="latex"
-          value={selectedBlock?.latex ?? activeDocument?.latex ?? ""}
+          value={activeDocument?.body ?? ""}
           theme="vs"
-          onChange={(value) => selectedBlock && onBlockLatex(value ?? "")}
+          onChange={(value) => onBodyLatex(value ?? "")}
           options={{ minimap: { enabled: false }, wordWrap: "on", fontSize: 14 }}
         />
-        {repairSuggestion && (
-          <div className="diff-panel">
-            <div className="panel-actions">
-              <strong>Repair Diff</strong>
-              <button title="Apply repair" onClick={onApplyRepair}>
-                <Check size={18} />
-              </button>
-              <button title="Discard repair" onClick={onDiscardRepair}>
-                <X size={18} />
-              </button>
-            </div>
-            <DiffEditor
-              height="240px"
-              language="latex"
-              original={repairSuggestion.original}
-              modified={repairSuggestion.repaired}
-              theme="vs"
-              options={{ readOnly: true, minimap: { enabled: false }, renderSideBySide: false, wordWrap: "on" }}
-            />
-            <div className="change-list">
-              {repairSuggestion.changes.map((change) => (
-                <span key={change}>{change}</span>
-              ))}
-            </div>
-          </div>
+        {compilePreview.status === "error" && (
+          <pre className="compile-error editor-error">{compilePreview.error || "LaTeX compile failed."}</pre>
         )}
-        {compileResult && (
-          <div className="compile-panel">
-            <div className="panel-actions">
-              <strong>{compileResult.ok ? "Compile OK" : `Compile ${compileResult.returncode}`}</strong>
-              <button title="Close preview" onClick={onClosePreview}>
-                <X size={18} />
-              </button>
-            </div>
-            {compileResult.preview_image_path ? (
-              <img className="pdf-preview-image" src={fileUrl(compileResult.preview_image_path)} alt="PDF preview" />
-            ) : compileResult.pdf_path ? (
-              <iframe title="PDF preview" src={fileUrl(compileResult.pdf_path)} />
-            ) : (
-              <pre>{compileLog(compileResult)}</pre>
-            )}
-            {!compileResult.ok && compileResult.pdf_path && <pre>{compileLog(compileResult)}</pre>}
-          </div>
-        )}
-        <pre className="latex-preview">{activeDocument?.latex}</pre>
       </div>
     </section>
+  );
+}
+
+function SourcePreviewPanel({ document }: { document?: DocumentResult }) {
+  const sourcePath = document?.original_copy_path || document?.source_path || "";
+  const isPdf = document?.source_type === "pdf" || sourcePath.toLowerCase().endsWith(".pdf");
+  return (
+    <div className="original-preview-panel">
+      <div className="panel-title">原始预览</div>
+      {sourcePath ? (
+        <div className={`source-stage ${isPdf ? "pdf-source" : ""}`}>
+          {isPdf ? (
+            <iframe title="Original PDF preview" src={fileUrl(sourcePath)} />
+          ) : (
+            <img src={fileUrl(sourcePath)} alt="" />
+          )}
+        </div>
+      ) : (
+        <div className="empty-panel">
+          <FileText size={42} />
+          <strong>等待识别任务</strong>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CompiledPreviewPanel({ state }: { state: CompilePreviewState }) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const [previewMode, setPreviewMode] = useState<"pdf" | "pages">("pdf");
+  const pages = previewImagePaths(state.result);
+  const pdfPath = state.status !== "error" && state.result?.pdf_path ? state.result.pdf_path : "";
+  const canShowPdf = pdfPath.length > 0;
+  const canShowPages = state.status !== "error" && pages.length > 0;
+  const activePreviewMode = canShowPdf && previewMode === "pdf" ? "pdf" : canShowPages ? "pages" : "pdf";
+  const showPdf = canShowPdf && activePreviewMode === "pdf";
+  const showPages = canShowPages && activePreviewMode === "pages";
+  const statusText =
+    state.status === "success"
+      ? pdfPath
+        ? pages.length > 0
+          ? `编译成功 · 完整 PDF · 已生成 ${pages.length} 页图`
+          : "编译成功 · 完整 PDF"
+        : `编译成功 · 预览 ${pages.length || 0} 页`
+      : state.status === "error"
+        ? "编译失败"
+        : state.status === "loading"
+          ? "正在编译"
+          : "等待编译";
+
+  useEffect(() => {
+    if (canShowPdf) {
+      setPreviewMode("pdf");
+    } else if (canShowPages) {
+      setPreviewMode("pages");
+    }
+  }, [canShowPdf, canShowPages, pdfPath, pages.length]);
+
+  useEffect(() => {
+    const panel = panelRef.current;
+    const stage = stageRef.current;
+    if (!panel || !stage) return;
+
+    const scrollPreview = (event: WheelEvent) => {
+      const maxTop = stage.scrollHeight - stage.clientHeight;
+      const maxLeft = stage.scrollWidth - stage.clientWidth;
+      if (maxTop <= 0 && maxLeft <= 0) return;
+
+      const multiplier =
+        event.deltaMode === WheelEvent.DOM_DELTA_LINE
+          ? 40
+          : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+            ? stage.clientHeight
+            : 1;
+      const nextTop = Math.max(0, Math.min(maxTop, stage.scrollTop + event.deltaY * multiplier));
+      const nextLeft = Math.max(0, Math.min(maxLeft, stage.scrollLeft + event.deltaX * multiplier));
+      if (nextTop === stage.scrollTop && nextLeft === stage.scrollLeft) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      stage.scrollTop = nextTop;
+      stage.scrollLeft = nextLeft;
+    };
+
+    panel.addEventListener("wheel", scrollPreview, { passive: false });
+    return () => panel.removeEventListener("wheel", scrollPreview);
+  }, [pages.length, state.status]);
+
+  return (
+    <div ref={panelRef} className="compiled-preview-panel">
+      <div className="panel-actions">
+        <div className="compiled-preview-heading">
+          <strong>编译预览</strong>
+          <span>{statusText}</span>
+        </div>
+        {canShowPdf && canShowPages && (
+          <div className="preview-mode-toggle" role="group" aria-label="预览模式">
+            <button
+              className={activePreviewMode === "pdf" ? "active" : ""}
+              title="完整 PDF"
+              onClick={() => setPreviewMode("pdf")}
+            >
+              <FileText size={14} />
+              PDF
+            </button>
+            <button
+              className={activePreviewMode === "pages" ? "active" : ""}
+              title="页图"
+              onClick={() => setPreviewMode("pages")}
+            >
+              <Image size={14} />
+              页图
+            </button>
+          </div>
+        )}
+      </div>
+      <div ref={stageRef} className={`compiled-preview-stage ${showPdf ? "pdf-viewer" : ""}`} tabIndex={0}>
+        {showPdf ? (
+          <iframe
+            key={`${pdfPath}-${state.cacheKey ?? "pending"}`}
+            title="Compiled PDF preview"
+            src={fileUrl(pdfPath, state.cacheKey)}
+          />
+        ) : showPages ? (
+          pages.map((path, index) => (
+            <figure key={`${path}-${index}-${state.cacheKey ?? "pending"}`}>
+              <img src={fileUrl(path, state.cacheKey)} alt={`Compiled page ${index + 1}`} />
+              <figcaption>Page {index + 1}</figcaption>
+            </figure>
+          ))
+        ) : state.status === "error" ? (
+          <pre className="compile-error">{state.error || "LaTeX compile failed."}</pre>
+        ) : (
+          <div className="empty-panel compact">
+            <FileText size={32} />
+            <strong>等待编译预览</strong>
+          </div>
+        )}
+        {state.status === "loading" && <div className="preview-loading-overlay">正在编译</div>}
+      </div>
+    </div>
   );
 }
 
@@ -615,13 +766,15 @@ function HistoryView({
   onQuery,
   onSearch,
   onClear,
+  onOpen,
 }: {
   query: string;
   onQuery: (value: string) => void;
   onSearch: () => void;
   onClear: () => void;
+  onOpen: (document: DocumentResult) => void;
 }) {
-  const { history, setActiveDocument } = useAppStore();
+  const { history } = useAppStore();
   return (
     <section className="section-grid">
       <div className="search-row">
@@ -634,7 +787,7 @@ function HistoryView({
       </div>
       <div className="history-grid">
         {history.map((document) => (
-          <button key={document.id} onClick={() => setActiveDocument(document)}>
+          <button key={document.id} onClick={() => onOpen(document)}>
             <Database size={18} />
             <strong>{document.title}</strong>
             <span>{new Date(document.created_at).toLocaleString()}</span>
@@ -647,19 +800,18 @@ function HistoryView({
 
 function ObservabilityView({
   fastDeployLog,
-  onStart,
   onStop,
   onReload,
   onRefresh,
 }: {
   fastDeployLog: string;
-  onStart: () => void;
   onStop: () => void;
   onReload: () => void;
   onRefresh: () => void;
 }) {
   const { observability } = useAppStore();
-  const gpu = observability?.gpu[0];
+  const displayGpu = displayGpuMetric(observability);
+  const gpu = displayGpu.metric;
   const durations = observability?.request_durations_ms ?? [];
   const latestDuration = durations.at(-1);
   const cache = observability?.cache ?? {};
@@ -667,15 +819,12 @@ function ObservabilityView({
     <section className="metrics-grid">
       <Metric label="Service" value={observability?.service.healthy ? "healthy" : "offline"} />
       <Metric label="Queue" value={observability?.queue_depth ?? 0} />
-      <Metric label="VRAM" value={gpu ? `${gpu.memory_used_mib}/${gpu.memory_total_mib} MiB` : "-"} />
+      <Metric label="VRAM" value={formatGpuMemory(gpu, displayGpu.isRecent)} />
       <Metric label="GPU" value={gpu?.utilization_percent != null ? `${gpu.utilization_percent}%` : "-"} />
       <Metric label="Last OCR" value={latestDuration != null ? `${Math.round(latestDuration)} ms` : "-"} />
       <div className="service-panel">
         <div className="panel-actions">
           <strong>FastDeploy</strong>
-          <button title="Start FastDeploy" onClick={onStart}>
-            <Play size={18} />
-          </button>
           <button title="Stop FastDeploy" onClick={onStop}>
             <Square size={18} />
           </button>
@@ -736,8 +885,6 @@ function SettingsView({
   const [latexEngine, setLatexEngine] = useState("xelatex");
   const [hotkey, setHotkey] = useState(defaultHotkey);
   const [cleanupPolicy, setCleanupPolicy] = useState(defaultCleanupPolicy);
-  const [promptTemplates, setPromptTemplates] = useState<Record<RecognitionMode, string>>(defaultPromptTemplates);
-  const [latexTemplate, setLatexTemplate] = useState(defaultLatexTemplate);
 
   useEffect(() => {
     if (!runtimeSettings) return;
@@ -746,16 +893,7 @@ function SettingsView({
     setLatexEngine(runtimeSettings.latex_engine);
     setHotkey(runtimeSettings.hotkey || defaultHotkey);
     setCleanupPolicy(runtimeSettings.cleanup_policy || defaultCleanupPolicy);
-    setPromptTemplates({
-      ...defaultPromptTemplates,
-      ...runtimeSettings.prompt_templates,
-    });
-    setLatexTemplate(runtimeSettings.latex_template || defaultLatexTemplate);
   }, [runtimeSettings]);
-
-  function updatePromptTemplate(mode: RecognitionMode, value: string) {
-    setPromptTemplates((current) => ({ ...current, [mode]: value }));
-  }
 
   function saveAllSettings() {
     onSaveSettings({
@@ -763,8 +901,6 @@ function SettingsView({
       history_days: historyDays,
       cleanup_policy: cleanupPolicy,
       hotkey,
-      prompt_templates: promptTemplates,
-      latex_template: latexTemplate,
       latex_engine: latexEngine,
     });
   }
@@ -823,21 +959,6 @@ function SettingsView({
           <input value={latexEngine} onChange={(event) => setLatexEngine(event.target.value)} />
         </label>
       </div>
-      <div className="settings-band wide">
-        <div className="panel-title">Prompts</div>
-        <div className="prompt-grid">
-          {(["auto", "formula", "table", "text"] as RecognitionMode[]).map((item) => (
-            <label className="field-column" key={item}>
-              <span>{item}</span>
-              <textarea value={promptTemplates[item]} onChange={(event) => updatePromptTemplate(item, event.target.value)} />
-            </label>
-          ))}
-        </div>
-      </div>
-      <div className="settings-band wide">
-        <div className="panel-title">LaTeX Template</div>
-        <textarea value={latexTemplate} onChange={(event) => setLatexTemplate(event.target.value)} />
-      </div>
       <div className="settings-band">
         <div className="panel-title">Environment</div>
         {environment?.tools.map((tool) => (
@@ -860,6 +981,63 @@ function Metric({ label, value }: { label: string; value: string | number }) {
   );
 }
 
+function displayGpuMetric(observability?: ObservabilitySnapshot): { metric?: GpuMetric; isRecent: boolean } {
+  const live = observability?.gpu.find((metric) => metric.memory_used_mib != null);
+  if (live) return { metric: live, isRecent: false };
+
+  const metrics = observability?.cache.metrics;
+  if (!Array.isArray(metrics)) return { isRecent: false };
+
+  for (const payload of metrics) {
+    if (!isRecord(payload) || !Array.isArray(payload.gpu)) continue;
+    const cached = payload.gpu.map(normalizeGpuMetric).find((metric) => metric?.memory_used_mib != null);
+    if (cached) return { metric: cached, isRecent: true };
+  }
+
+  return { isRecent: false };
+}
+
+function normalizeGpuMetric(value: unknown): GpuMetric | undefined {
+  if (!isRecord(value)) return undefined;
+  const memoryUsed = optionalNumber(value.memory_used_mib);
+  if (memoryUsed == null) return undefined;
+  return {
+    timestamp: typeof value.timestamp === "string" ? value.timestamp : "",
+    name: typeof value.name === "string" ? value.name : "GPU",
+    memory_used_mib: memoryUsed,
+    memory_total_mib: optionalNumber(value.memory_total_mib),
+    utilization_percent: optionalNumber(value.utilization_percent),
+  };
+}
+
+function optionalNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function formatGpuMemory(gpu?: GpuMetric, isRecent = false): string {
+  const prefix = isRecent ? "最近 " : "";
+  if (gpu?.memory_used_mib != null && gpu.memory_total_mib != null) {
+    return `${prefix}${gpu.memory_used_mib}/${gpu.memory_total_mib} MiB`;
+  }
+  if (gpu?.memory_used_mib != null) return `${prefix}${gpu.memory_used_mib} MiB`;
+  return "无数据";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err == null) return "unknown error";
+  return String(err);
+}
+
 function emptyObservability() {
   return {
     service: { running: false, endpoint: "http://127.0.0.1:8185", healthy: false, raw_status: {} },
@@ -875,27 +1053,6 @@ const defaultFastDeployArgsText =
   "--gpu-memory-utilization 0.6\n--max-model-len 8192\n--max-num-batched-tokens 8192\n--max-num-seqs 8";
 const defaultHotkey = "Ctrl+Alt+M";
 const defaultCleanupPolicy = "history_ttl";
-const defaultPromptTemplates: Record<RecognitionMode, string> = {
-  auto: "OCR:",
-  formula: "Formula Recognition:",
-  table: "Table Recognition:",
-  text: "OCR:",
-};
-const defaultLatexTemplate = [
-  "\\documentclass[UTF8]{ctexart}",
-  "\\usepackage{amsmath,amssymb}",
-  "\\usepackage{booktabs,longtable,array,graphicx}",
-  "\\usepackage[margin=2.5cm]{geometry}",
-  "\\title{{title}}",
-  "\\date{}",
-  "\\begin{document}",
-  "\\maketitle",
-  "",
-  "{body}",
-  "",
-  "\\end{document}",
-  "",
-].join("\n");
 
 function splitArgs(value: string): string[] {
   return (
@@ -919,6 +1076,13 @@ function compileLog(result: LatexCompileResult): string {
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+function previewImagePaths(result?: LatexCompileResult): string[] {
+  if (!result) return [];
+  const paths = result.preview_image_paths?.filter(Boolean) ?? [];
+  if (paths.length > 0) return paths;
+  return result.preview_image_path ? [result.preview_image_path] : [];
 }
 
 function extractLatexErrorSummary(stdout: string, stderr: string): string {
@@ -954,10 +1118,13 @@ function extractLatexErrorSummary(stdout: string, stderr: string): string {
   return interesting.join("\n").trim();
 }
 
-function fileUrl(path: string) {
+function fileUrl(path: string, cacheKey?: number) {
+  let url = path;
   try {
-    return convertFileSrc(path);
+    url = convertFileSrc(path);
   } catch {
-    return path;
+    url = path;
   }
+  if (cacheKey == null) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}texlensPreview=${encodeURIComponent(String(cacheKey))}`;
 }

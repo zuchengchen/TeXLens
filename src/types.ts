@@ -1,26 +1,3 @@
-export type BlockType = "title" | "paragraph" | "formula" | "table" | "image" | "unknown";
-export type RecognitionMode = "auto" | "formula" | "table" | "text";
-
-export interface OCRBlock {
-  id: string;
-  page: number;
-  block_type: BlockType;
-  bbox: [number, number, number, number];
-  text: string;
-  latex: string;
-  confidence?: number | null;
-  crop_path?: string | null;
-  raw: Record<string, unknown>;
-}
-
-export interface PageResult {
-  page: number;
-  image_path?: string | null;
-  width?: number | null;
-  height?: number | null;
-  blocks: OCRBlock[];
-}
-
 export interface DocumentResult {
   id: string;
   title: string;
@@ -29,7 +6,7 @@ export interface DocumentResult {
   created_at: string;
   updated_at: string;
   status: string;
-  pages: PageResult[];
+  body: string;
   latex: string;
   raw: Record<string, unknown>;
   thumbnail_path?: string | null;
@@ -49,7 +26,6 @@ export interface OCRTaskState {
   id: string;
   source_path: string;
   source_type: string;
-  mode: RecognitionMode;
   title?: string | null;
   status: string;
   current_page?: number | null;
@@ -106,13 +82,6 @@ export interface EnvironmentReport {
   tools: ToolStatus[];
 }
 
-export interface RepairSuggestion {
-  original: string;
-  repaired: string;
-  changes: string[];
-  requires_confirmation: boolean;
-}
-
 export interface LatexCompileResult {
   ok: boolean;
   returncode: number;
@@ -121,6 +90,7 @@ export interface LatexCompileResult {
   error_summary?: string;
   pdf_path?: string | null;
   preview_image_path?: string | null;
+  preview_image_paths?: string[];
 }
 
 export interface RuntimeSettings {
@@ -130,7 +100,5 @@ export interface RuntimeSettings {
   history_days: number;
   cleanup_policy: string;
   hotkey: string;
-  prompt_templates: Record<string, string>;
-  latex_template: string;
   latex_engine: string;
 }

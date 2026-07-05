@@ -63,4 +63,4 @@ Preview requires `xelatex` or `latexmk`. Recognition and `.tex` export still wor
 
 ## LaTeX Compile Errors
 
-Use the repair action. TeXLens performs conservative fixes only and shows the diff before applying. For formula or table errors, correct the relevant block and reassemble the document.
+Read the error summary shown under the right-side LaTeX body editor, edit the body directly, then run **Compile preview** again. Save TeX still writes a complete source file by wrapping the body with TeXLens' fixed internal template.
